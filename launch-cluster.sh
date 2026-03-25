@@ -30,6 +30,7 @@ MOD_PATHS=()
 MOD_TYPES=()
 LAUNCH_SCRIPT_PATH=""
 SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+CONFIG_FILE=""  # Will be set to default after argument parsing
 
 ACTIONS_ARG=""
 SOLO_MODE="false"
@@ -67,8 +68,26 @@ usage() {
     echo "  --mem-swap-limit-gb Memory+swap limit in GB (default: mem-limit + 10, only with --non-privileged)"
     echo "  --pids-limit    Process limit (default: 4096, only with --non-privileged)"
     echo "  --shm-size-gb   Shared memory size in GB (default: 64, only with --non-privileged)"
+    echo "  --config        Path to .env configuration file (default: .env in script directory)"
     echo "  action          start | stop | status | exec (Default: start). Not compatible with --launch-script."
     echo "  command         Command to run (only for 'exec' action). Not compatible with --launch-script."
+    echo ""
+    echo "Supported .env file variables:"
+    echo "  CLUSTER_NODES       Comma-separated list of node IPs"
+    echo "  ETH_IF              Ethernet interface name"
+    echo "  IB_IF               InfiniBand interface name"
+    echo "  MASTER_PORT         Port for cluster coordination (default: 29501)"
+    echo "  CONTAINER_NAME      Container name (default: vllm_node)"
+    echo "  CONTAINER_*         Any variable starting with CONTAINER_ becomes -e flag"
+    echo "                      Example: CONTAINER_NCCL_DEBUG=INFO -> -e NCCL_DEBUG=INFO"
+    echo ""
+    echo "Example .env file:"
+    echo "  CLUSTER_NODES=192.168.1.1,192.168.1.2"
+    echo "  ETH_IF=eth0"
+    echo "  IB_IF=ib0"
+    echo "  MASTER_PORT=29501"
+    echo "  CONTAINER_NCCL_DEBUG=INFO"
+    echo "  CONTAINER_HF_TOKEN=abc123"
     echo ""
     echo "Launch Script Usage:"
     echo "  $0 --launch-script examples/my-script.sh   # Script copied to container and executed"
@@ -108,6 +127,7 @@ while [[ "$#" -gt 0 ]]; do
         --shm-size-gb) SHM_SIZE_GB="$2"; shift ;;
         -d) DAEMON_MODE="true" ;;
         -h|--help) usage ;;
+        --config) CONFIG_FILE="$2"; shift ;;
         start|stop|status) 
             if [[ -n "$LAUNCH_SCRIPT_PATH" ]]; then
                 echo "Error: Action '$1' is not compatible with --launch-script. Please omit the action or not use --launch-script."
@@ -132,6 +152,108 @@ while [[ "$#" -gt 0 ]]; do
     esac
     shift
 done
+
+# Set .env file path (use default if not specified)
+if [[ -z "$CONFIG_FILE" ]]; then
+    CONFIG_FILE="$SCRIPT_DIR/.env"
+fi
+
+# Load .env file if exists
+if [[ -f "$CONFIG_FILE" ]]; then
+    echo "Loading configuration from .env file..."
+    
+    # Validate .env file syntax
+    if ! python3 -c "
+import sys
+import re
+
+env_file = '$CONFIG_FILE'
+seen_keys = set()
+
+with open(env_file, 'r') as f:
+    for line_num, line in enumerate(f, 1):
+        line = line.strip()
+        # Skip empty lines and comments
+        if not line or line.startswith('#'):
+            continue
+        
+        # Check for key=value format
+        if '=' not in line:
+            print(f'Error: Invalid syntax at line {line_num}: missing \"=\"')
+            sys.exit(1)
+        
+        key = line.split('=', 1)[0].strip()
+        
+        # Validate key format (alphanumeric + underscore)
+        if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', key):
+            print(f'Error: Invalid key format at line {line_num}: {key}')
+            sys.exit(1)
+        
+        # Check for duplicates
+        if key in seen_keys:
+            print(f'Error: Duplicate key at line {line_num}: {key}')
+            sys.exit(1)
+        
+        seen_keys.add(key)
+
+sys.exit(0)
+" 2>/dev/null; then
+        echo "Error: Invalid .env file syntax. Aborting."
+        exit 1
+    fi
+    
+    # Load .env variables with DOTENV_ prefix
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        # Skip comments and empty lines
+        [[ "$key" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$key" ]] && continue
+        
+        # Remove leading/trailing whitespace from key
+        key=$(echo "$key" | xargs)
+        
+        # Skip if key is empty after trimming
+        [[ -z "$key" ]] && continue
+        
+        # Remove quotes and whitespace from value using Python for proper shlex handling
+        value=$(python3 -c "
+import shlex
+import sys
+value = '''$value'''
+# Strip whitespace
+value = value.strip()
+# Remove surrounding quotes if present
+if (value.startswith('\"') and value.endswith('\"')) or (value.startswith(\"'\" ) and value.endswith(\"'\")):
+    value = value[1:-1]
+print(value)
+")
+        
+        # Export with DOTENV_ prefix
+        export "DOTENV_$key=$value"
+    done < "$CONFIG_FILE"
+    
+    echo "Loaded .env variables: $(compgen -v DOTENV_ | tr '\n' ' ')"
+fi
+
+# Apply .env configuration (CLI args take precedence)
+if [[ -z "$NODES_ARG" && -n "$DOTENV_CLUSTER_NODES" ]]; then
+    NODES_ARG="$DOTENV_CLUSTER_NODES"
+fi
+
+if [[ -z "$ETH_IF" && -n "$DOTENV_ETH_IF" ]]; then
+    ETH_IF="$DOTENV_ETH_IF"
+fi
+
+if [[ -z "$IB_IF" && -n "$DOTENV_IB_IF" ]]; then
+    IB_IF="$DOTENV_IB_IF"
+fi
+
+if [[ -z "$MASTER_PORT" || "$MASTER_PORT" == "29501" ]] && [[ -n "$DOTENV_MASTER_PORT" ]]; then
+    MASTER_PORT="$DOTENV_MASTER_PORT"
+fi
+
+if [[ -z "$CONTAINER_NAME" || "$CONTAINER_NAME" == "vllm_node" ]] && [[ -n "$DOTENV_CONTAINER_NAME" ]]; then
+    CONTAINER_NAME="$DOTENV_CONTAINER_NAME"
+fi
 
 # Validate non-privileged mode flags
 if [[ "$NON_PRIVILEGED_MODE" == "true" ]]; then
@@ -162,6 +284,22 @@ if [[ -n "$NCCL_DEBUG_VAL" ]]; then
             ;;
     esac
 fi
+
+# Add container environment variables from .env (CONTAINER_* pattern)
+for env_var in $(compgen -v DOTENV_CONTAINER_); do
+    # Get the value
+    value="${!env_var}"
+    
+    # Extract the actual env var name (remove DOTENV_CONTAINER_ prefix)
+    actual_var="${env_var#DOTENV_CONTAINER_}"
+    
+    # Properly escape the value for shell using Python
+    escaped_value=$(python3 -c "import shlex; print(shlex.quote('$value'))")
+    
+    # Add to docker args
+    DOCKER_ARGS="$DOCKER_ARGS -e $actual_var=$escaped_value"
+    echo "Adding container env: $actual_var"
+done
 
 # Add build job parallelization environment variables if BUILD_JOBS is set
 if [[ -n "$BUILD_JOBS" ]]; then
