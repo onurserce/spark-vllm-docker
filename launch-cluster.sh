@@ -416,6 +416,8 @@ source "$(dirname "$0")/autodiscover.sh"
 if [[ "${FORCE_DISCOVER:-false}" == "true" ]]; then
     # --setup: force full autodiscovery and save configuration
     echo "Running full autodiscovery (--setup)..."
+    # Clear pre-loaded values so detect functions run fresh instead of short-circuiting
+    ETH_IF="" IB_IF="" NODES_ARG="" LOCAL_IP=""
     detect_interfaces || exit 1
     detect_local_ip || exit 1
     detect_nodes || exit 1
