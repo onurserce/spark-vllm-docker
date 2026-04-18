@@ -231,6 +231,16 @@ RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pul
        fi \
     && rm pr39959.diff
 
+# TEMPORARY PATCH to fix torch bindings - https://github.com/vllm-project/vllm/pull/40191
+RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/40191.diff -o pr40191.diff \
+    && if git apply --reverse --check pr40191.diff 2>/dev/null; then \
+         echo "PR 40191 already applied, skipping."; \
+       else \
+         echo "Applying PR 40191..."; \
+         git apply -v pr40191.diff; \
+       fi \
+    && rm pr40191.diff
+
 # Prepare build requirements
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     python3 use_existing_torch.py && \
